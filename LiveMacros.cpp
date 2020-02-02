@@ -1,4 +1,25 @@
+/* -*- mode: c++ -*-
+ * Dygma::plugin::LiveMacros -- Plugin to save and play macros from the keyboard without 
+ * the need of any controller software.
+ * Copyright (C) 2020  Gonzalo Lopez (zalohasa@gmail.com)
+ *
+ * This program is free software: you can redistribute it and/or modify it under
+ * the terms of the GNU General Public License as published by the Free Software
+ * Foundation, version 3.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+ * details.
+ *
+ * You should have received a copy of the GNU General Public License along with
+ * this program. If not, see <http://www.gnu.org/licenses/>.
+ */
+
 #include "LiveMacros.h"
+
+#include <Kaleidoscope-EEPROM-Settings.h>
+#include "Kaleidoscope-FocusSerial.h"
 
 namespace Dygma{
 namespace plugin{
@@ -8,26 +29,22 @@ using namespace kaleidoscope;
 #define LM_KEY_PRESSED B10000000
 #define LM_KEY_PRESSED_MASK B01111111
 
+#define EEPROM_TOTAL_SIZE (MAX_EVENTS_IN_MACRO * 2 * TOTAL_MACROS_IN_EEPROM + TOTAL_MACROS_IN_EEPROM + 4)
+#define EEPROM_ONE_MACRO_SIZE (MAX_EVENTS_IN_MACRO * 2 + 1)
 
-#ifdef __arm__
-// should use uinstd.h to define sbrk but Due causes a conflict
+//Check the free ram
 extern "C" char* sbrk(int incr);
-#else  // __ARM__
-extern char *__brkval;
-#endif  // __arm__
 
 static int freeMemory() {
   char top;
-#ifdef __arm__
   return &top - reinterpret_cast<char*>(sbrk(0));
-#elif defined(CORE_TEENSY) || (ARDUINO > 103 && ARDUINO != 151)
-  return &top - __brkval;
-#else  // __arm__
-  return __brkval ? &top - __brkval : &top - __malloc_heap_start;
-#endif  // __arm__
 }
 
 
+/**
+ * Helper to create LED blinks with different times. The time is specified as the template argument.
+ * e.g. blinkLed<300>
+ */
 template <uint T>
 static cRGB& blinkLed(cRGB& colorOn, cRGB& colorOff)
 {
@@ -56,11 +73,63 @@ static void playMacroKeyswitchEvent(Key key, uint8_t keyswitch_state) {
   kaleidoscope::Runtime.hid().mouse().sendReport();
 }
 
-LiveMacrosPlugin::LiveMacrosPlugin() : 
-current_state_(state_t::IDLE), 
-current_buff_(nullptr), 
-current_buff_pos_(0),
-initialized_keys_(false)
+static bool isFreeMacroPosition(uint8_t macroNumber, uint16_t eeprom_base_addr, uint8_t** ramMacros)
+{
+    if (macroNumber < TOTAL_MACROS_IN_EEPROM)
+    {
+        uint16_t eepos = eeprom_base_addr + (EEPROM_ONE_MACRO_SIZE * macroNumber);
+        uint8_t macroSize = Runtime.storage().read(eepos);
+        if (macroSize > 0 && macroSize <= MAX_EVENTS_IN_MACRO)
+        {
+            return false;
+        }
+    }
+    else 
+    {
+        if (ramMacros[macroNumber])
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static void saveMacro(uint8_t macroNumber, uint8_t* buffer, uint16_t eeprom_base_addr, uint8_t** ramMacros)
+{
+    if (macroNumber < TOTAL_MACROS_IN_EEPROM)
+    {
+        //EEprom macro
+        uint16_t eepos = eeprom_base_addr + (EEPROM_ONE_MACRO_SIZE * macroNumber);
+        uint8_t currentSize = Runtime.storage().read(eepos);
+        
+        //Free key
+        Runtime.storage().write(eepos, buffer[0]);
+        for (uint8_t i = 1; i <= (buffer[0] * 2); ++i)
+        {
+            Runtime.storage().write(eepos + i, buffer[i]);
+        }
+        //TODO do the commit
+        free(buffer);
+    }
+    else
+    {
+        //RAM macro
+        //TODO if the key already have a buffer, copy the contents to the current key's buffer, to avoid memory fragmentation.
+        if (ramMacros[macroNumber])
+        {
+            free(ramMacros[macroNumber]);
+        }
+        ramMacros[macroNumber] = buffer;
+    }
+}
+
+static bool isRamMacro(uint8_t macroNumber)
+{
+    return (macroNumber >= TOTAL_MACROS_IN_EEPROM);
+}
+
+LiveMacrosPlugin::LiveMacrosPlugin() 
 {
     memset(keys_, 0, TOTAL_MACROS);
     for (uint8_t i = 0; i < TOTAL_PLUGIN_KEYS; ++i)
@@ -71,6 +140,9 @@ initialized_keys_(false)
 
 EventHandlerResult LiveMacrosPlugin::onSetup()
 {
+    //Size is Events*2*total number of macros + 1 byte for size of each macro + 4bytes at the end for version & checksum (someday)
+    eeprom_base_addr_ = ::EEPROMSettings.requestSlice(EEPROM_TOTAL_SIZE);
+    //TODO Check eeprom content
     return EventHandlerResult::OK;
 }
     
@@ -112,7 +184,7 @@ EventHandlerResult LiveMacrosPlugin::beforeReportingState()
                     cRGB color = {0, 0, 0};
                     if (keys_addrs_[i].isValid())
                     {
-                        if (keys_[i])
+                        if (!isFreeMacroPosition(i, eeprom_base_addr_, keys_))
                         {
                             color.r = 149;
                             color.g = 255;
@@ -138,16 +210,18 @@ EventHandlerResult LiveMacrosPlugin::beforeReportingState()
         case state_t::ARE_YOU_SURE_TO_OVERWRITE:
             if (keys_addrs_[KEY_START_INDEX].isValid())
             {
+                //Record key red blinking
                 cRGB color = {255, 0, 0};
                 cRGB off = {0, 0, 0};
                 ::LEDControl.setCrgbAt(keys_addrs_[KEY_START_INDEX], blinkLed<100>(color, off));
 
+                //Macro keys coloring.
                 for (uint8_t i = 0; i < TOTAL_MACROS; ++i)
                 {
                     color = {149, 255, 0};
                     if (keys_addrs_[i].isValid())
                     {
-                        if (keys_[i])
+                        if (!isFreeMacroPosition(i, eeprom_base_addr_, keys_))
                         {
                             color.r = 255;
                             color.g = 0;
@@ -157,13 +231,20 @@ EventHandlerResult LiveMacrosPlugin::beforeReportingState()
                         if (current_state_ == state_t::ARE_YOU_SURE_TO_OVERWRITE && macro_to_overwrite_ == i)
                         {
                             cRGB yellow = {209, 220, 27};
-                            ::LEDControl.setCrgbAt(keys_addrs_[i], blinkLed<500>(yellow, off));
+                            ::LEDControl.setCrgbAt(keys_addrs_[i], blinkLed<400>(yellow, color));
                         }
                         else
                         {
-                            ::LEDControl.setCrgbAt(keys_addrs_[i], color);
+                            if (isRamMacro(i))
+                            {
+                                cRGB blue = {0, 0, 255};
+                                ::LEDControl.setCrgbAt(keys_addrs_[i], blinkLed<400>(blue, color));
+                            }
+                            else
+                            {
+                                ::LEDControl.setCrgbAt(keys_addrs_[i], color);
+                            }
                         }
-                        
                     }
                 }
             }
@@ -184,7 +265,6 @@ EventHandlerResult LiveMacrosPlugin::beforeReportingState()
 
 EventHandlerResult LiveMacrosPlugin::onKeyswitchEvent(Key &mappedKey, KeyAddr key_addr, uint8_t keyState)
 {
-    
     switch(current_state_)
     {
         case state_t::IDLE:
@@ -194,7 +274,7 @@ EventHandlerResult LiveMacrosPlugin::onKeyswitchEvent(Key &mappedKey, KeyAddr ke
                 current_state_ = state_t::RECORDING;
                 if (current_buff_)
                 {
-                    //should never happend
+                    //should never happen
                     free(current_buff_);
                 }
                 //Allocate memory for the macro keys buffer. 
@@ -208,15 +288,22 @@ EventHandlerResult LiveMacrosPlugin::onKeyswitchEvent(Key &mappedKey, KeyAddr ke
             {
                 //Play a saved macro
                 uint8_t macroNumber = mappedKey.getRaw() - LM_SLOT_0_KEY;
-                if (keys_[macroNumber] != 0)
+                if (macroNumber < TOTAL_MACROS_IN_EEPROM)
                 {
-                    uint8_t* macro = keys_[macroNumber];
-                    uint8_t pos = 1;
-                    for (uint8_t i = 0; i < macro[0]; i++)
+                    //EEPROM macro
+                    uint16_t eepos = eeprom_base_addr_ + (EEPROM_ONE_MACRO_SIZE * macroNumber);
+                    uint8_t macroSize = Runtime.storage().read(eepos++);
+                    if (isFreeMacroPosition(macroNumber, eeprom_base_addr_, keys_))
                     {
-                        uint8_t flags = macro[pos++];
+                        return EventHandlerResult::EVENT_CONSUMED;
+                    }
+
+                    for (uint8_t i = 0; i < macroSize; i++)
+                    {
+                        uint8_t flags = Runtime.storage().read(eepos++);
+
                         //Check our custom key mask for pressed or released key
-                        Key key(macro[pos++], (flags & LM_KEY_PRESSED_MASK));
+                        Key key(Runtime.storage().read(eepos++), (flags & LM_KEY_PRESSED_MASK));
                         if (flags & LM_KEY_PRESSED)
                         {
                             playMacroKeyswitchEvent(key, IS_PRESSED);
@@ -224,6 +311,29 @@ EventHandlerResult LiveMacrosPlugin::onKeyswitchEvent(Key &mappedKey, KeyAddr ke
                         else
                         {
                             playMacroKeyswitchEvent(key, WAS_PRESSED);
+                        }
+                    }
+                }
+                else
+                {
+                    //RAM macro
+                    if (!isFreeMacroPosition(macroNumber, eeprom_base_addr_, keys_))
+                    {
+                        uint8_t* macro = keys_[macroNumber];
+                        uint8_t pos = 1;
+                        for (uint8_t i = 0; i < macro[0]; i++)
+                        {
+                            uint8_t flags = macro[pos++];
+                            //Check our custom key mask for pressed or released key
+                            Key key(macro[pos++], (flags & LM_KEY_PRESSED_MASK));
+                            if (flags & LM_KEY_PRESSED)
+                            {
+                                playMacroKeyswitchEvent(key, IS_PRESSED);
+                            }
+                            else
+                            {
+                                playMacroKeyswitchEvent(key, WAS_PRESSED);
+                            }
                         }
                     }
                 }
@@ -252,18 +362,17 @@ EventHandlerResult LiveMacrosPlugin::onKeyswitchEvent(Key &mappedKey, KeyAddr ke
             {
                 //Stop the recording and save the recording
                 uint8_t macroNumber = mappedKey.getRaw() - LM_SLOT_0_KEY;
-                
-                //TODO check if macro is smaller than the allocated buffer and then reallocate
                 //TODO check there is almost one event recorded. 
-                if (keys_[macroNumber])
+
+                if (!isFreeMacroPosition(macroNumber, eeprom_base_addr_, keys_))
                 {
-                    //Selected key has a saved macro. Ask the user to confirm the operation.
+                    //Macro already saved in key
                     current_state_ = state_t::ARE_YOU_SURE_TO_OVERWRITE;
                     macro_to_overwrite_ = macroNumber;
                     return EventHandlerResult::EVENT_CONSUMED;
                 }
 
-                keys_[macroNumber] = current_buff_;
+                saveMacro(macroNumber, current_buff_, eeprom_base_addr_, keys_);
                 current_buff_ = nullptr;
 
                 current_state_ = state_t::IDLE;
@@ -278,7 +387,6 @@ EventHandlerResult LiveMacrosPlugin::onKeyswitchEvent(Key &mappedKey, KeyAddr ke
                 {
                     ++(*current_buff_);
                     //Standard key
-                    Runtime.serialPort().write("nn\n");
                     if (keyToggledOn(keyState))
                     {
                         //As we know the key is not reserved, use the bit 7 in flags to store if this is a key press or key release.
@@ -295,10 +403,6 @@ EventHandlerResult LiveMacrosPlugin::onKeyswitchEvent(Key &mappedKey, KeyAddr ke
                     {
                         current_state_ = state_t::MAX_KEYS_REACHED;
                     }
-                }
-                else
-                {
-                    Runtime.serialPort().write("ign\n");
                 }
             }
             
@@ -323,20 +427,19 @@ EventHandlerResult LiveMacrosPlugin::onKeyswitchEvent(Key &mappedKey, KeyAddr ke
             {
                 //Stop the recording and save the recording
                 uint8_t macroNumber = mappedKey.getRaw() - LM_SLOT_0_KEY;
-                
-                //TODO check if macro is smaller than the allocated buffer and then reallocate
                 //TODO check there is almost one event recorded. 
-                if (keys_[macroNumber])
+
+                if (!isFreeMacroPosition(macroNumber, eeprom_base_addr_, keys_))
                 {
-                    //Selected key has a saved macro. Ask the user to confirm the operation.
+                    //Macro already saved in key
                     current_state_ = state_t::ARE_YOU_SURE_TO_OVERWRITE;
                     macro_to_overwrite_ = macroNumber;
                     return EventHandlerResult::EVENT_CONSUMED;
                 }
 
-                keys_[macroNumber] = current_buff_;
+                saveMacro(macroNumber, current_buff_, eeprom_base_addr_, keys_);
                 current_buff_ = nullptr;
-
+                
                 current_state_ = state_t::IDLE;
                 return EventHandlerResult::EVENT_CONSUMED;
             }
@@ -360,24 +463,17 @@ EventHandlerResult LiveMacrosPlugin::onKeyswitchEvent(Key &mappedKey, KeyAddr ke
             {
                 //Stop the recording and save the recording
                 uint8_t macroNumber = mappedKey.getRaw() - LM_SLOT_0_KEY;
-                                 
-                if (keys_[macroNumber])
+
+                if (!isFreeMacroPosition(macroNumber, eeprom_base_addr_, keys_) && macro_to_overwrite_ != macroNumber)
                 {
-                    if (macroNumber == macro_to_overwrite_)
-                    {
-                        free(keys_[macro_to_overwrite_]);
-                    }
-                    else
-                    {
-                        //The user has selected another key with saved macro
-                        macro_to_overwrite_ = macroNumber;
-                        return EventHandlerResult::EVENT_CONSUMED;
-                    }
+                    //The user has selected another key with saved macro
+                    macro_to_overwrite_ = macroNumber;
+                    return EventHandlerResult::EVENT_CONSUMED;
                 }
 
-                keys_[macroNumber] = current_buff_;
+                saveMacro(macroNumber, current_buff_, eeprom_base_addr_, keys_);
                 current_buff_ = nullptr;
-
+                
                 current_state_ = state_t::IDLE;
                 return EventHandlerResult::EVENT_CONSUMED;
             }
@@ -391,12 +487,58 @@ EventHandlerResult LiveMacrosPlugin::onKeyswitchEvent(Key &mappedKey, KeyAddr ke
     }
 }
 
-// EventHandlerResult LiveMacrosPlugin::onFocusEvent(const char *command)
-// {
+EventHandlerResult LiveMacrosPlugin::onFocusEvent(const char *command)
+{
+    if (::Focus.handleHelp(command, PSTR("lv.map\nlv.mapraw\nlv.clean\nlv.commit\nlv.freeram")))
+    return EventHandlerResult::OK;
 
-// }
+    if (strncmp_P(command, PSTR("lv."), 3) != 0)
+        return EventHandlerResult::OK;
 
+    if (strcmp_P(command + 3, PSTR("map")) == 0) 
+    {
+        if (::Focus.isEOL()) {
+            for (uint16_t i = 0; i < EEPROM_TOTAL_SIZE; i++) {
+                uint8_t b;
+                b = Runtime.storage().read(eeprom_base_addr_ + i);
+                ::Focus.send(b);
+            }
+        }
+    }
+
+    if (strcmp_P(command + 3, PSTR("mapraw")) == 0) 
+    {
+        if (::Focus.isEOL()) {
+            for (uint16_t i = 0; i < EEPROM_TOTAL_SIZE; i++) {
+                uint8_t b;
+                b = Runtime.storage().read(eeprom_base_addr_ + i);
+                Runtime.serialPort().write(b);
+            }
+        }
+    }
+
+    if (strcmp_P(command + 3, PSTR("clean")) == 0) 
+    {
+        for (uint16_t i = 0; i < EEPROM_TOTAL_SIZE; ++i)
+        {
+            Runtime.storage().write(eeprom_base_addr_ + i, 0xff);
+        }
+    }
+
+    if (strcmp_P(command + 3, PSTR("commit")) == 0) 
+    {
+        Runtime.storage().commit();
+    }
+
+    if (strcmp_P(command + 3, PSTR("freeram")) == 0) 
+    {
+        ::Focus.send(freeMemory());
+    }
+
+    return EventHandlerResult::EVENT_CONSUMED;
 }
-}
+
+}//namespace plugin
+}//namespace dygma
 
 Dygma::plugin::LiveMacrosPlugin LiveMacros;
